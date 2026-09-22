@@ -16,7 +16,9 @@ import os
 import re
 import smtplib
 import sys
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -99,7 +101,55 @@ def find_matching_jobs(lines):
     return sorted(set(matches))
 
 
-def send_email(new_findings: dict):
+def build_html_body(new_findings: dict, company_urls: dict) -> str:
+    """new_findings: {company_name: [job strings]}
+    company_urls:  {company_name: career_page_url}
+    Produces a clean HTML email with each company name linked to its
+    career page and jobs listed as bullets underneath.
+    """
+    total = sum(len(v) for v in new_findings.values())
+
+    rows = []
+    for company, jobs in new_findings.items():
+        url = company_urls.get(company, "#")
+        job_items = "".join(f"<li style='margin:4px 0;'>{escape(job)}</li>" for job in jobs)
+        rows.append(f"""
+        <div style="margin-bottom:20px;">
+          <a href="{escape(url)}" style="font-size:16px;font-weight:bold;color:#1a73e8;text-decoration:none;">
+            {escape(company)} &rarr;
+          </a>
+          <ul style="margin:6px 0 0 0;padding-left:20px;">
+            {job_items}
+          </ul>
+        </div>
+        """)
+
+    html = f"""\
+    <html>
+      <body style="font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.5;">
+        <h2 style="margin-bottom:4px;">🎯 {total} new job posting(s) found</h2>
+        <p style="color:#666;margin-top:0;">Click a company name to open its careers page.</p>
+        {''.join(rows)}
+        <hr style="border:none;border-top:1px solid #eee;margin-top:24px;">
+        <p style="color:#999;font-size:12px;">Sent automatically by your job monitor script.</p>
+      </body>
+    </html>
+    """
+    return html
+
+
+def build_plaintext_body(new_findings: dict, company_urls: dict) -> str:
+    """Plain-text fallback for email clients that don't render HTML."""
+    lines = ["New matching postings found:\n"]
+    for company, jobs in new_findings.items():
+        url = company_urls.get(company, "")
+        lines.append(f"\n{company} ({url}):" if url else f"\n{company}:")
+        for job in jobs:
+            lines.append(f"  - {job}")
+    return "\n".join(lines)
+
+
+def send_email(new_findings: dict, company_urls: dict):
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
     to_email = os.environ.get("TO_EMAIL", smtp_user)
@@ -109,17 +159,17 @@ def send_email(new_findings: dict):
         print(json.dumps(new_findings, indent=2, ensure_ascii=False))
         return
 
-    body_lines = ["New matching postings found:\n"]
-    for company, jobs in new_findings.items():
-        body_lines.append(f"\n{company}:")
-        for job in jobs:
-            body_lines.append(f"  - {job}")
-    body = "\n".join(body_lines)
+    total = sum(len(v) for v in new_findings.values())
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = f"Job alert: {sum(len(v) for v in new_findings.values())} new posting(s)"
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Job alert: {total} new posting(s)"
     msg["From"] = smtp_user
     msg["To"] = to_email
+
+    # Attach plain text first, HTML second — email clients prefer the last
+    # part that they can render, so HTML is used when supported.
+    msg.attach(MIMEText(build_plaintext_body(new_findings, company_urls), "plain", "utf-8"))
+    msg.attach(MIMEText(build_html_body(new_findings, company_urls), "html", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(smtp_user, smtp_pass)
@@ -132,6 +182,7 @@ def main():
     seen = load_json(STATE_FILE, {})  # {company_name: [job strings already notified]}
 
     new_findings = {}
+    company_urls = {c["name"]: c["url"] for c in companies}
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -164,7 +215,7 @@ def main():
     STATE_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if new_findings:
-        send_email(new_findings)
+        send_email(new_findings, company_urls)
     else:
         print("No new matches this run.")
 
