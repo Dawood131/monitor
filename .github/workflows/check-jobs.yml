@@ -1,0 +1,40 @@
+name: Check job postings
+
+on:
+  schedule:
+    # every 1 hour
+    - cron: "0 * * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run job checker
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: python check_jobs.py
+
+      - name: Commit updated seen_jobs.json
+        run: |
+          git config user.name "job-monitor-bot"
+          git config user.email "actions@github.com"
+          git add seen_jobs.json
+          git diff --quiet --cached || git commit -m "Update seen jobs [skip ci]"
+          git push
