@@ -46,12 +46,20 @@
   {"name": "PureLogics", "url": "https://purelogics.com/careers/"},
   {"name": "Rextech", "url": "https://rextechnologies.com/careers/"},
   {"name": "Systems Limited", "url": "https://www.systemsltd.com/careers"},
-  {"name": "TKXEL", "url": "https://tkxel.com/career/"},
+  {"name": "TKXEL", "url": "https://careers.tkxel.com/jobs/"},
   {"name": "Techlogix", "url": "https://www.techlogix.com/careers/"},
   {"name": "Technology Rivers", "url": "https://technologyrivers.com/careers/"},
   {"name": "Tintash", "url": "https://tintash.com/career/"},
   {"name": "VentureDive", "url": "https://venturedive.applytojob.com/apply/#alljobs"},
   {"name": "Xavor Pakistan", "url": "https://xavor.com/careers/"},
   {"name": "WhizzBridge", "url": "https://www.whizzbridge.com/careers"},
-  {"name": "DTCforce", "url": "https://dtcforce.com/career"}
+  {"name": "DTCforce", "url": "https://dtcforce.com/career"},
+  { "name": "Trango Tech", "url": "https://trangotech.com/careers/" },
+  { "name": "Xeven Solutions", "url": "https://xevensolutions.com/careers" },
+  { "name": "Soft Steer", "url": "https://softsteer.com/career/" },
+  { "name": "TycoonZ Solutions", "url": "https://tycoonzsolutions.com/careers" },
+  { "name": "Indeed - Frontend Developer", "url": "https://pk.indeed.com/Frontend-Developer-jobs" },
+  { "name": "Indeed - React Developer", "url": "https://pk.indeed.com/q-react-developer-jobs.html" },
+  { "name": "Indeed - MERN Stack", "url": "https://pk.indeed.com/q-mern-jobs.html" },
+  { "name": "Indeed - Next.js Developer", "url": "https://pk.indeed.com/q-next-js-developer-jobs.html" }
 ]
