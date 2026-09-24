@@ -2,8 +2,8 @@ name: Check job postings
 
 on:
   schedule:
-    # every 1 hour
-    - cron: "0 * * * *"
+    # every 3 hours
+    - cron: "0 */3 * * *"
   workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
 
 permissions:
