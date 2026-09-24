@@ -61,5 +61,10 @@
   { "name": "Indeed - Frontend Developer", "url": "https://pk.indeed.com/Frontend-Developer-jobs" },
   { "name": "Indeed - React Developer", "url": "https://pk.indeed.com/q-react-developer-jobs.html" },
   { "name": "Indeed - MERN Stack", "url": "https://pk.indeed.com/q-mern-jobs.html" },
-  { "name": "Indeed - Next.js Developer", "url": "https://pk.indeed.com/q-next-js-developer-jobs.html" }
+  { "name": "Indeed - Next.js Developer", "url": "https://pk.indeed.com/q-next-js-developer-jobs.html" },
+  { "name": "Indeed - JavaScript Developer", "url": "https://pk.indeed.com/q-javascript-developer-jobs.html" },
+  { "name": "Indeed - Web Developer", "url": "https://pk.indeed.com/q-web-developer-jobs.html" },
+  { "name": "Indeed - UI Developer", "url": "https://pk.indeed.com/q-ui-developer-jobs.html" },
+  { "name": "Indeed - Front End Developer", "url": "https://pk.indeed.com/q-front-end-developer-jobs.html" },
+  { "name": "Indeed - React JS", "url": "https://pk.indeed.com/q-react-js-jobs.html" }
 ]
