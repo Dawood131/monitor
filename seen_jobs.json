@@ -21,7 +21,9 @@
   "Codeavour": [],
   "DevsSpace IT Services": [],
   "First Idea Web Development": [],
-  "Glowingsoft Technologies": [],
+  "Glowingsoft Technologies": [
+    "MERN Stack Development"
+  ],
   "Intagleo Systems": [],
   "Stack360": [],
   "TechAbout": [
@@ -30,7 +32,9 @@
   ],
   "The Xpertz Web Solutions": [],
   "Xcentric Services": [],
-  "ZAPTA Technologies": [],
+  "ZAPTA Technologies": [
+    "Front End Developer"
+  ],
   "InvoZone": [
     "Front End Developers",
     "JavaScript Developers",
