@@ -32,15 +32,14 @@ STATE_FILE = BASE_DIR / "seen_jobs.json"
 
 # Keywords that mean "this looks like a job I want"
 KEYWORDS = [
-    r"frontend\s*developer",
-    r"front[\s-]?end\s*developer",
-    r"react\s*(js)?\s*developer",
-    r"react\.js",
-    r"next\.js",
-    r"mern\s*stack",
-    r"ui\s*developer",
-    r"javascript\s*developer",
-    r"web\s*developer",
+    r"front[\s-]?end\s*(developer|engineer|dev\b)",
+    r"react(\.?js)?\s*(developer|engineer)",
+    r"next\.?js",
+    r"mern",
+    r"full[\s-]?stack\s*(web\s*)?(developer|engineer|development)",
+    r"ui\s*(developer|engineer)",
+    r"(javascript|typescript)\s*(developer|engineer)",
+    r"web\s*(developer|engineer)",
 ]
 KEYWORD_RE = re.compile("|".join(KEYWORDS), re.IGNORECASE)
 
@@ -197,6 +196,8 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
                 print(f"[jooble] '{q}' / {loc} failed: {e}")
                 continue
             print(f"[jooble] '{q}' / {loc}: {len(jobs)} results")
+            for j in jobs[:6]:  # sample titles, so filter problems are visible in the logs
+                print(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
             for j in jobs:
                 title = clean_text(j.get("title"))
                 company = clean_text(j.get("company")) or "Unknown company"
@@ -324,7 +325,8 @@ def main():
                     continue
 
                 lines = extract_candidate_lines(html)
-                if len(lines) < 15:  # probably still loading - retry once, slower
+                bot_wall = block_reason(html, len(lines) + 99)  # marker check only
+                if len(lines) < 15 and not bot_wall:  # still loading? retry once, slower
                     try:
                         html = fetch_rendered_html(browser, url, wait_ms=10000)
                         lines = extract_candidate_lines(html)
