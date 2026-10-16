@@ -16,6 +16,8 @@ import os
 import re
 import smtplib
 import sys
+import urllib.request
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
@@ -140,23 +142,107 @@ def block_reason(html: str, line_count: int):
     return None
 
 
-def build_html_body(new_findings: dict, company_urls: dict) -> str:
+# ---------------------------------------------------------------------------
+# Jooble aggregator (official free API) - catches jobs from companies that are
+# NOT in companies.json. Needs a free key from https://jooble.org/api/about
+# stored as the GitHub secret JOOBLE_API_KEY. Edit the lists below freely.
+# ---------------------------------------------------------------------------
+JOOBLE_QUERIES = [
+    "frontend developer",
+    "react developer",
+]
+JOOBLE_LOCATIONS = ["Lahore"]
+
+# The free key has a request quota (500), so Jooble is only queried on a few
+# runs per day (UTC hours below -> 1 run/day x 2 queries = ~2 requests/day).
+# A manual "Run workflow" always queries it, so you can test any time.
+JOOBLE_RUN_HOURS_UTC = {6, 7}
+
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def clean_text(t) -> str:
+    return re.sub(r"\s+", " ", TAG_RE.sub("", t or "")).strip()
+
+
+def fetch_jooble(api_key: str, keywords: str, location: str):
+    req = urllib.request.Request(
+        f"https://jooble.org/api/{api_key}",
+        data=json.dumps({"keywords": keywords, "location": location, "page": "1"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8")).get("jobs", [])
+
+
+def check_jooble(seen: dict, new_findings: dict, job_links: dict):
+    api_key = os.environ.get("JOOBLE_API_KEY")
+    if not api_key:
+        print("[jooble] JOOBLE_API_KEY not set - skipping aggregator search")
+        return
+
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if not manual and datetime.now(timezone.utc).hour not in JOOBLE_RUN_HOURS_UTC:
+        print("[jooble] skipped this run (only queried ~1x/day to save API quota)")
+        return
+
+    already = set(seen.get("Jooble", []))
+    found = {}  # "Company | Title" -> (company, title, link)
+    for q in JOOBLE_QUERIES:
+        for loc in JOOBLE_LOCATIONS:
+            try:
+                jobs = fetch_jooble(api_key, q, loc)
+            except Exception as e:
+                print(f"[jooble] '{q}' / {loc} failed: {e}")
+                continue
+            print(f"[jooble] '{q}' / {loc}: {len(jobs)} results")
+            for j in jobs:
+                title = clean_text(j.get("title"))
+                company = clean_text(j.get("company")) or "Unknown company"
+                if not title or not KEYWORD_RE.search(title) or EXCLUDE_RE.search(title):
+                    continue
+                found[f"{company} | {title}"] = (company, title, j.get("link") or "")
+
+    fresh = 0
+    for key, (company, title, link) in found.items():
+        if key in already:
+            continue
+        label = f"{company} (via Jooble)"
+        new_findings.setdefault(label, []).append(title)
+        job_links[(label, title)] = link
+        fresh += 1
+    seen["Jooble"] = sorted(already | set(found))  # cumulative, like company pages
+    print(f"[jooble] {len(found)} matching jobs, {fresh} new")
+
+
+def build_html_body(new_findings: dict, company_urls: dict, job_links: dict = None) -> str:
     """new_findings: {company_name: [job strings]}
     company_urls:  {company_name: career_page_url}
     Produces a clean HTML email with each company name linked to its
     career page and jobs listed as bullets underneath.
     """
+    job_links = job_links or {}
     total = sum(len(v) for v in new_findings.values())
 
     rows = []
     for company, jobs in new_findings.items():
-        url = company_urls.get(company, "#")
-        job_items = "".join(f"<li style='margin:4px 0;'>{escape(job)}</li>" for job in jobs)
+        url = company_urls.get(company)
+        items = []
+        for job in jobs:
+            link = job_links.get((company, job))
+            label = (f'<a href="{escape(link)}" style="color:#1a73e8;">{escape(job)}</a>'
+                     if link else escape(job))
+            items.append(f"<li style='margin:4px 0;'>{label}</li>")
+        job_items = "".join(items)
+        if url:
+            head = (f'<a href="{escape(url)}" style="font-size:16px;font-weight:bold;'
+                    f'color:#1a73e8;text-decoration:none;">{escape(company)} &rarr;</a>')
+        else:
+            head = f'<span style="font-size:16px;font-weight:bold;">{escape(company)}</span>'
         rows.append(f"""
         <div style="margin-bottom:20px;">
-          <a href="{escape(url)}" style="font-size:16px;font-weight:bold;color:#1a73e8;text-decoration:none;">
-            {escape(company)} &rarr;
-          </a>
+          {head}
           <ul style="margin:6px 0 0 0;padding-left:20px;">
             {job_items}
           </ul>
@@ -167,7 +253,7 @@ def build_html_body(new_findings: dict, company_urls: dict) -> str:
     <html>
       <body style="font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.5;">
         <h2 style="margin-bottom:4px;">🎯 {total} new job posting(s) found</h2>
-        <p style="color:#666;margin-top:0;">Click a company name to open its careers page.</p>
+        <p style="color:#666;margin-top:0;">Click a company or job title to open it.</p>
         {''.join(rows)}
         <hr style="border:none;border-top:1px solid #eee;margin-top:24px;">
         <p style="color:#999;font-size:12px;">Sent automatically by your job monitor script.</p>
@@ -177,18 +263,19 @@ def build_html_body(new_findings: dict, company_urls: dict) -> str:
     return html
 
 
-def build_plaintext_body(new_findings: dict, company_urls: dict) -> str:
+def build_plaintext_body(new_findings: dict, company_urls: dict, job_links: dict = None) -> str:
     """Plain-text fallback for email clients that don't render HTML."""
     lines = ["New matching postings found:\n"]
     for company, jobs in new_findings.items():
         url = company_urls.get(company, "")
         lines.append(f"\n{company} ({url}):" if url else f"\n{company}:")
         for job in jobs:
-            lines.append(f"  - {job}")
+            link = (job_links or {}).get((company, job))
+            lines.append(f"  - {job}" + (f"  {link}" if link else ""))
     return "\n".join(lines)
 
 
-def send_email(new_findings: dict, company_urls: dict):
+def send_email(new_findings: dict, company_urls: dict, job_links: dict = None):
     smtp_user = os.environ.get("SMTP_USER")
     smtp_pass = os.environ.get("SMTP_PASS")
     to_email = os.environ.get("TO_EMAIL", smtp_user)
@@ -207,8 +294,8 @@ def send_email(new_findings: dict, company_urls: dict):
 
     # Attach plain text first, HTML second — email clients prefer the last
     # part that they can render, so HTML is used when supported.
-    msg.attach(MIMEText(build_plaintext_body(new_findings, company_urls), "plain", "utf-8"))
-    msg.attach(MIMEText(build_html_body(new_findings, company_urls), "html", "utf-8"))
+    msg.attach(MIMEText(build_plaintext_body(new_findings, company_urls, job_links), "plain", "utf-8"))
+    msg.attach(MIMEText(build_html_body(new_findings, company_urls, job_links), "html", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(smtp_user, smtp_pass)
@@ -222,6 +309,7 @@ def main():
 
     new_findings = {}
     suspicious = []
+    job_links = {}
     company_urls = {c["name"]: c["url"] for c in companies}
 
     with sync_playwright() as p:
@@ -264,6 +352,8 @@ def main():
         finally:
             browser.close()
 
+    check_jooble(seen, new_findings, job_links)
+
     if suspicious:
         print("\n=== Pages that look blocked/empty (check these URLs) ===")
         for n in suspicious:
@@ -272,7 +362,7 @@ def main():
     STATE_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if new_findings:
-        send_email(new_findings, company_urls)
+        send_email(new_findings, company_urls, job_links)
     else:
         print("No new matches this run.")
 
