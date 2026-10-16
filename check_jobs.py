@@ -55,17 +55,33 @@ USER_AGENT = (
 
 
 def fetch_rendered_html(browser, url: str, wait_ms: int = 4000) -> str:
-    """Load a page in a real headless browser and return the HTML
-    *after* JavaScript has run, so client-side-rendered job listings
-    (React/Next.js/Angular sites) actually show up."""
-    page = browser.new_page(user_agent=USER_AGENT)
+    """Load a page in a real headless browser and return the HTML *after*
+    JavaScript has run. Also: ignores expired/bad SSL certificates (some small
+    company sites have them), waits for network to settle, scrolls once to
+    trigger lazy-loaded lists, and appends iframe content (Workable / Zoho
+    Recruit / ApplyToJob style career widgets live inside iframes)."""
+    context = browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
+    page = context.new_page()
     try:
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        # give JS-rendered lists a moment to populate
+        try:
+            page.wait_for_load_state("networkidle", timeout=6000)
+        except Exception:
+            pass
         page.wait_for_timeout(wait_ms)
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
         html = page.content()
+        for frame in page.frames[1:]:
+            try:
+                html += "\n" + frame.content()
+            except Exception:
+                pass
     finally:
-        page.close()
+        context.close()
     return html
 
 
@@ -102,15 +118,26 @@ def find_matching_jobs(lines):
 
 
 BLOCK_MARKERS = (
-    "captcha", "just a moment", "access denied", "verify you are human",
-    "unusual traffic", "are you a robot", "cf-challenge", "enable javascript and cookies",
+    "verify you are human", "just a moment", "access denied", "unusual traffic",
+    "are you a robot", "checking your browser", "please complete the security check",
+    "enable javascript and cookies to continue",
 )
 
 
-def looks_blocked(html: str, line_count: int) -> bool:
-    """True when the page is probably a bot-check / empty shell rather than real content."""
-    low = html.lower()
-    return line_count < 15 or any(m in low for m in BLOCK_MARKERS)
+def block_reason(html: str, line_count: int):
+    """Return a short reason string if the page looks blocked/empty, else None.
+    Only looks at VISIBLE text (scripts/styles removed), so a reCAPTCHA script
+    on a normal contact form no longer causes a false alarm."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    visible = soup.get_text(" ", strip=True).lower()
+    for m in BLOCK_MARKERS:
+        if m in visible[:3000]:
+            return f"bot-check text found: '{m}'"
+    if line_count < 15:
+        return f"only {line_count} text lines (empty shell / JS portal / iframe)"
+    return None
 
 
 def build_html_body(new_findings: dict, company_urls: dict) -> str:
@@ -209,14 +236,21 @@ def main():
                     continue
 
                 lines = extract_candidate_lines(html)
+                if len(lines) < 15:  # probably still loading - retry once, slower
+                    try:
+                        html = fetch_rendered_html(browser, url, wait_ms=10000)
+                        lines = extract_candidate_lines(html)
+                    except Exception as e:
+                        print(f"[retry-fail] {name}: {e}")
                 matches = find_matching_jobs(lines)
 
                 already_seen = set(seen.get(name, []))
                 fresh = [m for m in matches if m not in already_seen]
 
-                if looks_blocked(html, len(lines)):
-                    suspicious.append(name)
-                    print(f"[WARN] {name}: only {len(lines)} text lines - page blocked/empty/JS not loaded?")
+                reason = block_reason(html, len(lines))
+                if reason:
+                    suspicious.append(f"{name} -> {reason}")
+                    print(f"[WARN] {name}: {reason}")
 
                 if fresh:
                     new_findings[name] = fresh
