@@ -101,6 +101,18 @@ def find_matching_jobs(lines):
     return sorted(set(matches))
 
 
+BLOCK_MARKERS = (
+    "captcha", "just a moment", "access denied", "verify you are human",
+    "unusual traffic", "are you a robot", "cf-challenge", "enable javascript and cookies",
+)
+
+
+def looks_blocked(html: str, line_count: int) -> bool:
+    """True when the page is probably a bot-check / empty shell rather than real content."""
+    low = html.lower()
+    return line_count < 15 or any(m in low for m in BLOCK_MARKERS)
+
+
 def build_html_body(new_findings: dict, company_urls: dict) -> str:
     """new_findings: {company_name: [job strings]}
     company_urls:  {company_name: career_page_url}
@@ -182,6 +194,7 @@ def main():
     seen = load_json(STATE_FILE, {})  # {company_name: [job strings already notified]}
 
     new_findings = {}
+    suspicious = []
     company_urls = {c["name"]: c["url"] for c in companies}
 
     with sync_playwright() as p:
@@ -201,16 +214,26 @@ def main():
                 already_seen = set(seen.get(name, []))
                 fresh = [m for m in matches if m not in already_seen]
 
+                if looks_blocked(html, len(lines)):
+                    suspicious.append(name)
+                    print(f"[WARN] {name}: only {len(lines)} text lines - page blocked/empty/JS not loaded?")
+
                 if fresh:
                     new_findings[name] = fresh
                     print(f"[NEW] {name}: {fresh}")
                 else:
-                    print(f"[ok] {name}: no new matches ({len(matches)} known)")
+                    print(f"[ok] {name}: no new matches ({len(matches)} on page, {len(lines)} lines scanned)")
 
-                # update state with everything currently seen for this company
-                seen[name] = matches
+                # CUMULATIVE: never forget a job once seen. This is what stops
+                # repeat emails when a page loads half-empty on some runs.
+                seen[name] = sorted(already_seen | set(matches))
         finally:
             browser.close()
+
+    if suspicious:
+        print("\n=== Pages that look blocked/empty (check these URLs) ===")
+        for n in suspicious:
+            print(f"  - {n}")
 
     STATE_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False), encoding="utf-8")
 
