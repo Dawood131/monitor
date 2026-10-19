@@ -161,6 +161,13 @@ JOOBLE_RUN_HOURS_UTC = {6, 7}
 # How many result pages to read per query (each page = 1 request).
 JOOBLE_PAGES = 2
 
+JOOBLE_REPORT = []  # lines shown on the GitHub run Summary page
+
+
+def jlog(msg: str):
+    print(msg)
+    JOOBLE_REPORT.append(msg)
+
 # Company-by-company search (Jooble's `companysearch` mode) for your watchlist.
 # 0 = OFF (default). Each company costs 1 request, so only turn this on after
 # Jooble raises your quota. e.g. 10 = check the next 10 watchlist companies per
@@ -208,7 +215,7 @@ def load_watchlist():
             if col:
                 names += [(r.get(col) or "").strip() for r in reader]
         except Exception as e:
-            print(f"[jooble] could not read master.csv: {e}")
+            jlog(f"[jooble] could not read master.csv: {e}")
     unique, seen_norm = [], set()
     for n in names:
         k = norm_company(n)
@@ -244,16 +251,16 @@ def fetch_jooble(api_key: str, keywords: str, location: str, page: int = 1, comp
 def check_jooble(seen: dict, new_findings: dict, job_links: dict):
     api_key = os.environ.get("JOOBLE_API_KEY")
     if not api_key:
-        print("[jooble] JOOBLE_API_KEY not set - skipping aggregator search")
+        jlog("[jooble] JOOBLE_API_KEY not set - skipping aggregator search")
         return
 
     manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     if not manual and datetime.now(timezone.utc).hour not in JOOBLE_RUN_HOURS_UTC:
-        print("[jooble] skipped this run (only queried ~1x/day to save API quota)")
+        jlog("[jooble] skipped this run (only queried ~1x/day to save API quota)")
         return
 
     watch_names, watch_norm = load_watchlist()
-    print(f"[jooble] watchlist: {len(watch_names)} companies")
+    jlog(f"[jooble] watchlist: {len(watch_names)} companies")
     already = set(seen.get("Jooble", []))
     found = {}  # "Company | Title" -> (company, title, link, starred)
 
@@ -274,12 +281,12 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
                 try:
                     jobs = fetch_jooble(api_key, q, loc, page=page)
                 except Exception as e:
-                    print(f"[jooble] '{q}' / {loc} p{page} failed: {e}")
+                    jlog(f"[jooble] '{q}' / {loc} p{page} failed: {e}")
                     break
-                print(f"[jooble] '{q}' / {loc} p{page}: {len(jobs)} results")
+                jlog(f"[jooble] '{q}' / {loc} p{page}: {len(jobs)} results")
                 if page == 1:
                     for j in jobs[:6]:  # sample titles, so filter problems are visible in logs
-                        print(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
+                        jlog(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
                 for j in jobs:
                     consider(j)
                 if not jobs:
@@ -294,11 +301,11 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
             try:
                 jobs = fetch_jooble(api_key, name, JOOBLE_LOCATIONS[0], companysearch=True)
             except Exception as e:
-                print(f"[jooble] company search '{name}' failed: {e}")
+                jlog(f"[jooble] company search '{name}' failed: {e}")
                 continue
             hits = [j for j in jobs if norm_company(clean_text(j.get("company"))) == norm_company(name)
                     or on_watchlist(clean_text(j.get("company")), watch_norm)]
-            print(f"[jooble] company '{name}': {len(jobs)} results, {len(hits)} from that company")
+            jlog(f"[jooble] company '{name}': {len(jobs)} results, {len(hits)} from that company")
             for j in hits:
                 consider(j, force_watch=True)
 
@@ -312,7 +319,7 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
         fresh += 1
     seen["Jooble"] = sorted(already | set(found))  # cumulative, like company pages
     starred_n = sum(1 for v in found.values() if v[3])
-    print(f"[jooble] {len(found)} matching jobs ({starred_n} from watchlist companies), {fresh} new")
+    jlog(f"[jooble] {len(found)} matching jobs ({starred_n} from watchlist companies), {fresh} new")
 
 
 def build_html_body(new_findings: dict, company_urls: dict, job_links: dict = None) -> str:
@@ -402,12 +409,32 @@ def send_email(new_findings: dict, company_urls: dict, job_links: dict = None):
     print(f"Email sent to {to_email}")
 
 
+def write_step_summary(total, skipped, suspicious, new_findings):
+    """Shows a readable report on the GitHub run's Summary page."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    new_jobs = sum(len(v) for v in new_findings.values())
+    out = ["## Job monitor summary", "",
+           f"- Company pages checked: **{total}**  |  could not load: **{len(skipped)}**  |  look blocked/empty: **{len(suspicious)}**",
+           f"- New jobs found this run (emailed): **{new_jobs}**", "",
+           "### Jooble", ""]
+    out += [f"- {line.replace('[jooble] ', '').strip()}" for line in JOOBLE_REPORT] or ["- (Jooble did not run)"]
+    if skipped:
+        out += ["", "### Could not load", ""] + [f"- {n}" for n in skipped]
+    if suspicious:
+        out += ["", "### Blocked / empty pages", ""] + [f"- {n}" for n in suspicious]
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
 def main():
     companies = load_json(COMPANIES_FILE, [])
     seen = load_json(STATE_FILE, {})  # {company_name: [job strings already notified]}
 
     new_findings = {}
     suspicious = []
+    skipped = []
     job_links = {}
     company_urls = {c["name"]: c["url"] for c in companies}
 
@@ -420,6 +447,7 @@ def main():
                     html = fetch_rendered_html(browser, url)
                 except Exception as e:
                     print(f"[skip] {name}: could not load ({e})")
+                    skipped.append(name)
                     continue
 
                 lines = extract_candidate_lines(html)
@@ -466,6 +494,8 @@ def main():
         send_email(new_findings, company_urls, job_links)
     else:
         print("No new matches this run.")
+
+    write_step_summary(len(companies), skipped, suspicious, new_findings)
 
 
 if __name__ == "__main__":
