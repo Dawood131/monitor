@@ -11,6 +11,7 @@ by GitHub Actions (free), not kept running on your own machine.
 See README.md for setup.
 """
 
+import csv
 import json
 import os
 import re
@@ -157,6 +158,27 @@ JOOBLE_LOCATIONS = ["Lahore"]
 # A manual "Run workflow" always queries it, so you can test any time.
 JOOBLE_RUN_HOURS_UTC = {6, 7}
 
+# How many result pages to read per query (each page = 1 request).
+JOOBLE_PAGES = 2
+
+# Company-by-company search (Jooble's `companysearch` mode) for your watchlist.
+# 0 = OFF (default). Each company costs 1 request, so only turn this on after
+# Jooble raises your quota. e.g. 10 = check the next 10 watchlist companies per
+# daily run, cycling through the whole list.
+JOOBLE_COMPANY_BATCH = 0
+
+# Titles accepted for WATCHLIST companies (looser than KEYWORD_RE, because for
+# companies you care about you want to see more roles).
+WATCH_ROLE_RE = re.compile(
+    r"front[\s-]?end|react|mern|next\.?js|full[\s-]?stack|web|ui\s*(developer|engineer)|"
+    r"javascript|typescript|software\s*(engineer|developer)",
+    re.IGNORECASE,
+)
+_NOISE_RE = re.compile(
+    r"\b(pvt|private|limited|ltd|llc|inc|technologies|technology|solutions|software|systems|"
+    r"services|group|co|company|lahore|branch|house|studios?)\b"
+)
+
 TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -164,10 +186,54 @@ def clean_text(t) -> str:
     return re.sub(r"\s+", " ", TAG_RE.sub("", t or "")).strip()
 
 
-def fetch_jooble(api_key: str, keywords: str, location: str):
+def norm_company(name: str) -> str:
+    name = re.sub(r"\(.*?\)", " ", (name or "").lower())
+    return re.sub(r"[^a-z0-9]+", "", _NOISE_RE.sub(" ", name))
+
+
+def load_watchlist():
+    """Company names to prioritise: the 'Company' column of master.csv if it
+    exists (your big sheet), plus everything in companies.json."""
+    names = [c["name"] for c in load_json(COMPANIES_FILE, [])]
+    master = BASE_DIR / "master.csv"
+    if master.exists():
+        try:
+            text = master.read_text(encoding="utf-8-sig")
+            try:
+                dialect = csv.Sniffer().sniff(text[:3000], delimiters=",\t;")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(text.splitlines(), dialect=dialect)
+            col = next((h for h in (reader.fieldnames or []) if h.strip().lower() == "company"), None)
+            if col:
+                names += [(r.get(col) or "").strip() for r in reader]
+        except Exception as e:
+            print(f"[jooble] could not read master.csv: {e}")
+    unique, seen_norm = [], set()
+    for n in names:
+        k = norm_company(n)
+        if n and k and k not in seen_norm:
+            seen_norm.add(k)
+            unique.append(n)
+    return unique, seen_norm
+
+
+def on_watchlist(company: str, watch_norm: set) -> bool:
+    nj = norm_company(company)
+    if not nj:
+        return False
+    if nj in watch_norm:
+        return True
+    return any(min(len(w), len(nj)) >= 8 and (w in nj or nj in w) for w in watch_norm)
+
+
+def fetch_jooble(api_key: str, keywords: str, location: str, page: int = 1, companysearch: bool = False):
+    payload = {"keywords": keywords, "location": location, "page": str(page)}
+    if companysearch:
+        payload["companysearch"] = "true"
     req = urllib.request.Request(
         f"https://jooble.org/api/{api_key}",
-        data=json.dumps({"keywords": keywords, "location": location, "page": "1"}).encode("utf-8"),
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -186,35 +252,67 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
         print("[jooble] skipped this run (only queried ~1x/day to save API quota)")
         return
 
+    watch_names, watch_norm = load_watchlist()
+    print(f"[jooble] watchlist: {len(watch_names)} companies")
     already = set(seen.get("Jooble", []))
-    found = {}  # "Company | Title" -> (company, title, link)
+    found = {}  # "Company | Title" -> (company, title, link, starred)
+
+    def consider(j, force_watch=False):
+        title = clean_text(j.get("title"))
+        company = clean_text(j.get("company")) or "Unknown company"
+        if not title or EXCLUDE_RE.search(title):
+            return
+        starred = force_watch or on_watchlist(company, watch_norm)
+        ok = (WATCH_ROLE_RE.search(title) if starred else KEYWORD_RE.search(title))
+        if ok:
+            found[f"{company} | {title}"] = (company, title, j.get("link") or "", starred)
+
+    # 1) broad keyword searches (a few pages each)
     for q in JOOBLE_QUERIES:
         for loc in JOOBLE_LOCATIONS:
+            for page in range(1, JOOBLE_PAGES + 1):
+                try:
+                    jobs = fetch_jooble(api_key, q, loc, page=page)
+                except Exception as e:
+                    print(f"[jooble] '{q}' / {loc} p{page} failed: {e}")
+                    break
+                print(f"[jooble] '{q}' / {loc} p{page}: {len(jobs)} results")
+                if page == 1:
+                    for j in jobs[:6]:  # sample titles, so filter problems are visible in logs
+                        print(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
+                for j in jobs:
+                    consider(j)
+                if not jobs:
+                    break
+
+    # 2) optional: company-by-company search over a rotating slice of the watchlist
+    if JOOBLE_COMPANY_BATCH > 0 and watch_names:
+        start = int((seen.get("_jooble_cursor") or ["0"])[0]) % len(watch_names)
+        batch = [watch_names[(start + i) % len(watch_names)] for i in range(min(JOOBLE_COMPANY_BATCH, len(watch_names)))]
+        seen["_jooble_cursor"] = [str((start + len(batch)) % len(watch_names))]
+        for name in batch:
             try:
-                jobs = fetch_jooble(api_key, q, loc)
+                jobs = fetch_jooble(api_key, name, JOOBLE_LOCATIONS[0], companysearch=True)
             except Exception as e:
-                print(f"[jooble] '{q}' / {loc} failed: {e}")
+                print(f"[jooble] company search '{name}' failed: {e}")
                 continue
-            print(f"[jooble] '{q}' / {loc}: {len(jobs)} results")
-            for j in jobs[:6]:  # sample titles, so filter problems are visible in the logs
-                print(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
-            for j in jobs:
-                title = clean_text(j.get("title"))
-                company = clean_text(j.get("company")) or "Unknown company"
-                if not title or not KEYWORD_RE.search(title) or EXCLUDE_RE.search(title):
-                    continue
-                found[f"{company} | {title}"] = (company, title, j.get("link") or "")
+            hits = [j for j in jobs if norm_company(clean_text(j.get("company"))) == norm_company(name)
+                    or on_watchlist(clean_text(j.get("company")), watch_norm)]
+            print(f"[jooble] company '{name}': {len(jobs)} results, {len(hits)} from that company")
+            for j in hits:
+                consider(j, force_watch=True)
 
     fresh = 0
-    for key, (company, title, link) in found.items():
+    for key, (company, title, link, starred) in found.items():
         if key in already:
             continue
-        label = f"{company} (via Jooble)"
+        label = f"{'★ ' if starred else ''}{company} (via Jooble)"
         new_findings.setdefault(label, []).append(title)
         job_links[(label, title)] = link
         fresh += 1
     seen["Jooble"] = sorted(already | set(found))  # cumulative, like company pages
-    print(f"[jooble] {len(found)} matching jobs, {fresh} new")
+    starred_n = sum(1 for v in found.values() if v[3])
+    print(f"[jooble] {len(found)} matching jobs ({starred_n} from watchlist companies), {fresh} new")
 
 
 def build_html_body(new_findings: dict, company_urls: dict, job_links: dict = None) -> str:
@@ -355,6 +453,7 @@ def main():
             browser.close()
 
     check_jooble(seen, new_findings, job_links)
+    new_findings = dict(sorted(new_findings.items(), key=lambda kv: not kv[0].startswith("★")))
 
     if suspicious:
         print("\n=== Pages that look blocked/empty (check these URLs) ===")
