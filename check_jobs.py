@@ -111,6 +111,25 @@ def extract_candidate_lines(html: str):
     return lines
 
 
+def extract_links(html: str, base_url: str) -> dict:
+    """Map visible text -> absolute link, so each emailed job can link straight
+    to its own posting when its title is (inside) a link on the page."""
+    from urllib.parse import urljoin
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    links = {}
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "a", "li", "span", "p"]):
+        text = tag.get_text(strip=True)
+        if not (text and 3 <= len(text) <= 120) or text in links:
+            continue
+        a = tag if tag.name == "a" else (tag.find_parent("a") or tag.find("a"))
+        href = (a.get("href") or "").strip() if a else ""
+        if href and not href.startswith(("javascript:", "#", "mailto:", "tel:")):
+            links[text] = urljoin(base_url, href)
+    return links
+
+
 def find_matching_jobs(lines):
     matches = []
     for line in lines:
@@ -151,7 +170,16 @@ JOOBLE_QUERIES = [
     "frontend developer",
     "react developer",
 ]
-JOOBLE_LOCATIONS = ["Lahore"]
+JOOBLE_LOCATIONS = ["Lahore, Pakistan"]
+
+# Jooble's API returned US jobs for plain "Lahore", so we (a) ask for
+# "Lahore, Pakistan", (b) try these API addresses and keep the first one that
+# really returns Pakistani jobs, and (c) drop any job whose location is not in
+# Pakistan (or remote). Costs at most 2 extra requests per daily run.
+JOOBLE_API_BASES = ["https://jooble.org/api/", "https://pk.jooble.org/api/"]
+JOOBLE_LOCATION_OK_RE = re.compile(
+    r"pakistan|lahore|punjab|islamabad|karachi|rawalpindi|faisalabad|multan|remote", re.IGNORECASE
+)
 
 # The free key has a request quota (500), so Jooble is only queried on a few
 # runs per day (UTC hours below -> 1 run/day x 2 queries = ~2 requests/day).
@@ -234,18 +262,34 @@ def on_watchlist(company: str, watch_norm: set) -> bool:
     return any(min(len(w), len(nj)) >= 8 and (w in nj or nj in w) for w in watch_norm)
 
 
-def fetch_jooble(api_key: str, keywords: str, location: str, page: int = 1, companysearch: bool = False):
+def fetch_jooble(api_key: str, keywords: str, location: str, page: int = 1, companysearch: bool = False,
+                 base: str = "https://jooble.org/api/"):
     payload = {"keywords": keywords, "location": location, "page": str(page)}
     if companysearch:
         payload["companysearch"] = "true"
     req = urllib.request.Request(
-        f"https://jooble.org/api/{api_key}",
+        f"{base}{api_key}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode("utf-8")).get("jobs", [])
+
+
+def pick_jooble_base(api_key: str) -> str:
+    for base in JOOBLE_API_BASES:
+        try:
+            jobs = fetch_jooble(api_key, "developer", JOOBLE_LOCATIONS[0], base=base)
+        except Exception as e:
+            jlog(f"[jooble] address {base} failed: {e}")
+            continue
+        ok = sum(1 for j in jobs if JOOBLE_LOCATION_OK_RE.search(clean_text(j.get("location"))))
+        jlog(f"[jooble] address {base}: {len(jobs)} results, {ok} in Pakistan/remote")
+        if ok:
+            return base
+    jlog("[jooble] WARNING: no address returned Pakistani jobs - ask Jooble support which endpoint covers Pakistan")
+    return JOOBLE_API_BASES[0]
 
 
 def check_jooble(seen: dict, new_findings: dict, job_links: dict):
@@ -259,6 +303,7 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
         jlog("[jooble] skipped this run (only queried ~1x/day to save API quota)")
         return
 
+    base = pick_jooble_base(api_key)
     watch_names, watch_norm = load_watchlist()
     jlog(f"[jooble] watchlist: {len(watch_names)} companies")
     already = set(seen.get("Jooble", []))
@@ -267,8 +312,11 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
     def consider(j, force_watch=False):
         title = clean_text(j.get("title"))
         company = clean_text(j.get("company")) or "Unknown company"
+        loc = clean_text(j.get("location"))
         if not title or EXCLUDE_RE.search(title):
             return
+        if loc and not JOOBLE_LOCATION_OK_RE.search(loc):
+            return  # e.g. jobs in the USA
         starred = force_watch or on_watchlist(company, watch_norm)
         ok = (WATCH_ROLE_RE.search(title) if starred else KEYWORD_RE.search(title))
         if ok:
@@ -279,14 +327,14 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
         for loc in JOOBLE_LOCATIONS:
             for page in range(1, JOOBLE_PAGES + 1):
                 try:
-                    jobs = fetch_jooble(api_key, q, loc, page=page)
+                    jobs = fetch_jooble(api_key, q, loc, page=page, base=base)
                 except Exception as e:
                     jlog(f"[jooble] '{q}' / {loc} p{page} failed: {e}")
                     break
                 jlog(f"[jooble] '{q}' / {loc} p{page}: {len(jobs)} results")
                 if page == 1:
                     for j in jobs[:6]:  # sample titles, so filter problems are visible in logs
-                        jlog(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))}")
+                        jlog(f"[jooble]    sample: {clean_text(j.get('title'))} @ {clean_text(j.get('company'))} ({clean_text(j.get('location'))})")
                 for j in jobs:
                     consider(j)
                 if not jobs:
@@ -299,7 +347,7 @@ def check_jooble(seen: dict, new_findings: dict, job_links: dict):
         seen["_jooble_cursor"] = [str((start + len(batch)) % len(watch_names))]
         for name in batch:
             try:
-                jobs = fetch_jooble(api_key, name, JOOBLE_LOCATIONS[0], companysearch=True)
+                jobs = fetch_jooble(api_key, name, JOOBLE_LOCATIONS[0], companysearch=True, base=base)
             except Exception as e:
                 jlog(f"[jooble] company search '{name}' failed: {e}")
                 continue
@@ -470,6 +518,13 @@ def main():
 
                 if fresh:
                     new_findings[name] = fresh
+                    try:
+                        link_map = extract_links(html, url)
+                        for m in fresh:
+                            if link_map.get(m):
+                                job_links[(name, m)] = link_map[m]
+                    except Exception as e:
+                        print(f"[links] {name}: could not read links ({e})")
                     print(f"[NEW] {name}: {fresh}")
                 else:
                     print(f"[ok] {name}: no new matches ({len(matches)} on page, {len(lines)} lines scanned)")
