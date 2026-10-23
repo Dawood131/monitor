@@ -23,6 +23,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -457,6 +458,84 @@ def send_email(new_findings: dict, company_urls: dict, job_links: dict = None):
     print(f"Email sent to {to_email}")
 
 
+# ---------------------------------------------------------------------------
+# Rozee.pk search pages need their own parser: the page also contains a sidebar
+# of filter labels ("Full Stack Developer 4", "Lahore 15"...) which are NOT jobs.
+# Real jobs are links like /EN/frontend-developer-lahore-jobs-1896465, so we read
+# only those, identify each job by its numeric id, and keep only allowed cities.
+# ---------------------------------------------------------------------------
+ROZEE_MARK = "rozee.pk/job/jsearch"
+ROZEE_ALLOWED_CITIES = ("lahore",)  # city word must be in the job link; () = every city
+ROZEE_JOB_PATH_RE = re.compile(r"(?:^|/)(?:[A-Za-z]{2}/)?([a-z0-9][a-z0-9-]*)-jobs-(\d+)/?$", re.IGNORECASE)
+GENERIC_LINK_TEXT = {"apply", "apply now", "easy apply", "view", "view job", "view details", "details", "more", "save"}
+ROZEE_REPORT = []
+
+
+def rlog(msg: str):
+    print(msg)
+    ROZEE_REPORT.append(msg)
+
+
+def extract_rozee_jobs(html: str, base_url: str):
+    """Return [{'id','title','slug','link'}] for real job links on a Rozee page."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        m = ROZEE_JOB_PATH_RE.search(urlparse(href).path)
+        if not m:
+            continue
+        slug, job_id = m.group(1).lower(), m.group(2)
+        job = found.setdefault(job_id, {"id": job_id, "slug": slug, "link": urljoin(base_url, href), "texts": []})
+        text = a.get_text(" ", strip=True)
+        if text and 3 <= len(text) <= 120 and text.lower() not in GENERIC_LINK_TEXT:
+            job["texts"].append(text)
+
+    jobs = []
+    for job in found.values():
+        slug = job["slug"]
+        title_from_slug = (slug.rsplit("-", 1)[0] if "-" in slug else slug).replace("-", " ").title()
+        texts = job.pop("texts")
+        title = next((t for t in texts if KEYWORD_RE.search(t)), None) or (texts[0] if texts else title_from_slug)
+        job["title"] = title
+        job["slug_title"] = title_from_slug
+        jobs.append(job)
+    return jobs
+
+
+def handle_rozee(name, url, html, seen, new_findings, job_links):
+    jobs = extract_rozee_jobs(html, url)
+    if ROZEE_ALLOWED_CITIES:
+        in_city = [j for j in jobs if any(c in j["slug"] for c in ROZEE_ALLOWED_CITIES)]
+    else:
+        in_city = jobs
+    matched = [
+        j for j in in_city
+        if (KEYWORD_RE.search(j["title"]) or KEYWORD_RE.search(j["slug_title"]))
+        and not EXCLUDE_RE.search(j["title"])
+    ]
+    already = set(seen.get("Rozee", []))
+    ids_seen = {x.split("|", 1)[0] for x in already}
+    fresh = [j for j in matched if j["id"] not in ids_seen]
+
+    rlog(f"[rozee] {name}: {len(jobs)} job links on page, {len(in_city)} in allowed cities, "
+         f"{len(matched)} match keywords, {len(fresh)} new")
+    if not jobs:
+        rlog(f"[rozee] {name}: WARNING no job links found - page not rendered or Rozee changed its layout")
+    for j in matched[:3]:
+        rlog(f"[rozee]    sample: {j['title']} -> {j['link']}")
+
+    label = "Rozee.pk (Lahore)" if ROZEE_ALLOWED_CITIES == ("lahore",) else "Rozee.pk"
+    for j in fresh:
+        display = f"{j['title']} (#{j['id']})"
+        new_findings.setdefault(label, []).append(display)
+        job_links[(label, display)] = j["link"]
+
+    merged = already | {f"{j['id']}|{j['title']}" for j in matched}
+    # keep the file small: newest 3000 ids only
+    seen["Rozee"] = sorted(merged, key=lambda x: int(x.split("|", 1)[0]), reverse=True)[:3000]
+
+
 def write_step_summary(total, skipped, suspicious, new_findings):
     """Shows a readable report on the GitHub run's Summary page."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -468,6 +547,8 @@ def write_step_summary(total, skipped, suspicious, new_findings):
            f"- New jobs found this run (emailed): **{new_jobs}**", "",
            "### Jooble", ""]
     out += [f"- {line.replace('[jooble] ', '').strip()}" for line in JOOBLE_REPORT] or ["- (Jooble did not run)"]
+    if ROZEE_REPORT:
+        out += ["", "### Rozee.pk", ""] + [f"- {l.replace('[rozee] ', '').strip()}" for l in ROZEE_REPORT]
     if skipped:
         out += ["", "### Could not load", ""] + [f"- {n}" for n in skipped]
     if suspicious:
@@ -479,6 +560,9 @@ def write_step_summary(total, skipped, suspicious, new_findings):
 def main():
     companies = load_json(COMPANIES_FILE, [])
     seen = load_json(STATE_FILE, {})  # {company_name: [job strings already notified]}
+
+    for stale in [k for k in seen if k.startswith("Rozee - ")]:
+        del seen[stale]  # old, wrongly collected filter labels
 
     new_findings = {}
     suspicious = []
@@ -496,6 +580,15 @@ def main():
                 except Exception as e:
                     print(f"[skip] {name}: could not load ({e})")
                     skipped.append(name)
+                    continue
+
+                if ROZEE_MARK in url:
+                    if not extract_rozee_jobs(html, url):  # not rendered yet - retry once, slower
+                        try:
+                            html = fetch_rendered_html(browser, url, wait_ms=10000)
+                        except Exception as e:
+                            print(f"[retry-fail] {name}: {e}")
+                    handle_rozee(name, url, html, seen, new_findings, job_links)
                     continue
 
                 lines = extract_candidate_lines(html)
