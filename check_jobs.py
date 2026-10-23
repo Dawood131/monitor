@@ -190,6 +190,11 @@ JOOBLE_RUN_HOURS_UTC = {6, 7}
 # How many result pages to read per query (each page = 1 request).
 JOOBLE_PAGES = 2
 
+# Jooble's API returned only US jobs for this key (and pk.jooble.org gave 403).
+# Switched OFF so it stops using up your 500 requests. Set to True again if
+# Jooble support enables Pakistan for your key.
+JOOBLE_ENABLED = False
+
 JOOBLE_REPORT = []  # lines shown on the GitHub run Summary page
 
 
@@ -294,6 +299,9 @@ def pick_jooble_base(api_key: str) -> str:
 
 
 def check_jooble(seen: dict, new_findings: dict, job_links: dict):
+    if not JOOBLE_ENABLED:
+        jlog("[jooble] switched off (API only returned US jobs for this key)")
+        return
     api_key = os.environ.get("JOOBLE_API_KEY")
     if not api_key:
         jlog("[jooble] JOOBLE_API_KEY not set - skipping aggregator search")
@@ -486,7 +494,8 @@ def extract_rozee_jobs(html: str, base_url: str):
         if not m:
             continue
         slug, job_id = m.group(1).lower(), m.group(2)
-        job = found.setdefault(job_id, {"id": job_id, "slug": slug, "link": urljoin(base_url, href), "texts": []})
+        clean_link = urlparse(urljoin(base_url, href))._replace(query="", fragment="").geturl()
+        job = found.setdefault(job_id, {"id": job_id, "slug": slug, "link": clean_link, "texts": []})
         text = a.get_text(" ", strip=True)
         if text and 3 <= len(text) <= 120 and text.lower() not in GENERIC_LINK_TEXT:
             job["texts"].append(text)
