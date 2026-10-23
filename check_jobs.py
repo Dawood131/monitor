@@ -536,6 +536,101 @@ def handle_rozee(name, url, html, seen, new_findings, job_links):
     seen["Rozee"] = sorted(merged, key=lambda x: int(x.split("|", 1)[0]), reverse=True)[:3000]
 
 
+# ---------------------------------------------------------------------------
+# Remote job boards with PUBLIC APIs (no key, no login, no bot-blocking):
+#   RemoteOK  https://remoteok.com/api          (terms: link back + credit Remote OK)
+#   Remotive  https://remotive.com/api/remote-jobs   (feed is ~24h delayed)
+# Only jobs open to Pakistan (worldwide / anywhere / Asia / Pakistan) are kept.
+# Queried on a few runs per day only (same schedule gate as Jooble).
+# ---------------------------------------------------------------------------
+REMOTE_RUN_HOURS_UTC = {6, 7, 18, 19}
+REMOTEOK_TAGS = ["react", "frontend"]
+REMOTE_LOCATION_OK_RE = re.compile(
+    r"worldwide|anywhere|global|asia|pakistan|apac|international|^remote$|^$", re.IGNORECASE
+)
+REMOTE_REPORT = []
+
+
+def blog(msg: str):
+    print(msg)
+    REMOTE_REPORT.append(msg)
+
+
+def http_get_json(url: str, timeout: int = 40):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (personal job alert script)", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _remote_gate() -> bool:
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    return manual or datetime.now(timezone.utc).hour in REMOTE_RUN_HOURS_UTC
+
+
+def _collect_remote(source: str, items, new_findings, job_links, seen):
+    """items: [(id, title, company, location, link)] -> new_findings, cumulative by id."""
+    already = set(seen.get(source, []))
+    ids_seen = {x.split("|", 1)[0] for x in already}
+    matched = []
+    for jid, title, company, location, link in items:
+        title, company, location = clean_text(title), clean_text(company) or "Unknown company", clean_text(location)
+        if not title or not KEYWORD_RE.search(title) or EXCLUDE_RE.search(title):
+            continue
+        if not REMOTE_LOCATION_OK_RE.search(location):
+            continue
+        matched.append((str(jid), title, company, link))
+    fresh = [m for m in matched if m[0] not in ids_seen]
+    for jid, title, company, link in fresh:
+        label = f"{company} (via {source})"
+        display = title
+        n = 2
+        while display in [d for d in new_findings.get(label, [])]:  # same title twice at one company
+            display = f"{title} ({n})"; n += 1
+        new_findings.setdefault(label, []).append(display)
+        job_links[(label, display)] = link
+    blog(f"[remote] {source}: {len(items)} jobs in feed, {len(matched)} match keywords + open to Pakistan, {len(fresh)} new")
+    for jid, title, company, link in matched[:3]:
+        blog(f"[remote]    sample: {title} @ {company}")
+    merged = already | {f"{m[0]}|{m[1]}" for m in matched}
+    seen[source] = sorted(merged, key=lambda x: int(re.sub(r"\D", "", x.split("|", 1)[0]) or 0), reverse=True)[:3000]
+
+
+def check_remote_boards(seen: dict, new_findings: dict, job_links: dict):
+    if not _remote_gate():
+        blog("[remote] skipped this run (remote boards are queried ~2x/day)")
+        return
+
+    # RemoteOK: first element of the JSON list is a legal notice, not a job
+    items = {}
+    for tag in REMOTEOK_TAGS:
+        try:
+            data = http_get_json(f"https://remoteok.com/api?tags={tag}")
+        except Exception as e:
+            blog(f"[remote] RemoteOK tag '{tag}' failed: {e}")
+            continue
+        for j in data:
+            if isinstance(j, dict) and j.get("position"):
+                items[str(j.get("id"))] = (j.get("id"), j.get("position"), j.get("company"),
+                                           j.get("location") or "", j.get("url") or j.get("apply_url") or "")
+    if items:
+        _collect_remote("RemoteOK", list(items.values()), new_findings, job_links, seen)
+
+    # Remotive: fetch the whole feed, filter locally (server-side filters are unreliable)
+    try:
+        data = http_get_json("https://remotive.com/api/remote-jobs")
+        jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        _collect_remote(
+            "Remotive",
+            [(j.get("id"), j.get("title"), j.get("company_name"), j.get("candidate_required_location") or "", j.get("url") or "")
+             for j in jobs],
+            new_findings, job_links, seen,
+        )
+    except Exception as e:
+        blog(f"[remote] Remotive failed: {e}")
+
+
 def write_step_summary(total, skipped, suspicious, new_findings):
     """Shows a readable report on the GitHub run's Summary page."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -547,6 +642,8 @@ def write_step_summary(total, skipped, suspicious, new_findings):
            f"- New jobs found this run (emailed): **{new_jobs}**", "",
            "### Jooble", ""]
     out += [f"- {line.replace('[jooble] ', '').strip()}" for line in JOOBLE_REPORT] or ["- (Jooble did not run)"]
+    if REMOTE_REPORT:
+        out += ["", "### Remote job boards (RemoteOK / Remotive)", ""] + [f"- {l.replace('[remote] ', '').strip()}" for l in REMOTE_REPORT]
     if ROZEE_REPORT:
         out += ["", "### Rozee.pk", ""] + [f"- {l.replace('[rozee] ', '').strip()}" for l in ROZEE_REPORT]
     if skipped:
@@ -629,6 +726,7 @@ def main():
             browser.close()
 
     check_jooble(seen, new_findings, job_links)
+    check_remote_boards(seen, new_findings, job_links)
     new_findings = dict(sorted(new_findings.items(), key=lambda kv: not kv[0].startswith("★")))
 
     if suspicious:
