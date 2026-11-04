@@ -23,7 +23,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -227,9 +227,15 @@ def clean_text(t) -> str:
     return re.sub(r"\s+", " ", TAG_RE.sub("", t or "")).strip()
 
 
+_LEGAL_RE = re.compile(r"\b(pvt|private|limited|ltd|llc|inc)\b")
+
+
 def norm_company(name: str) -> str:
     name = re.sub(r"\(.*?\)", " ", (name or "").lower())
-    return re.sub(r"[^a-z0-9]+", "", _NOISE_RE.sub(" ", name))
+    key = re.sub(r"[^a-z0-9]+", "", _NOISE_RE.sub(" ", name))
+    if not key:  # e.g. "Systems Limited": every word was 'noise', keep the meaningful part
+        key = re.sub(r"[^a-z0-9]+", "", _LEGAL_RE.sub(" ", name))
+    return key
 
 
 def load_watchlist():
@@ -512,7 +518,83 @@ def extract_rozee_jobs(html: str, base_url: str):
     return jobs
 
 
-def handle_rozee(name, url, html, seen, new_findings, job_links):
+ROZEE_ENRICH_MAX = 25          # open at most this many NEW job pages per run
+ROZEE_SKIP_UNVERIFIED = False  # True = do not alert for jobs from unverified companies
+_DATE_RE = r"([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})"
+_WATCH_CACHE = {}
+
+
+def _parse_date(text):
+    try:
+        return datetime.strptime(re.sub(r"\s+", " ", text.strip()), "%b %d, %Y").date()
+    except Exception:
+        return None
+
+
+def parse_rozee_job_page(html: str) -> dict:
+    """Company, verified flag, dates and 'crawled' flag from a Rozee job page."""
+    soup = BeautifulSoup(html, "html.parser")
+    info = {"company": "", "unverified": None, "crawled": False, "posted": None, "apply_before": None}
+
+    # company: the page <title> is "<Title> Job, <City>, <Company> - ROZEE.PK"
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    m = re.match(r"^(.*?)\s+Job,\s*([^,]+),\s*(.+?)\s*-\s*ROZEE\.PK\s*$", title)
+    if m:
+        info["company"] = m.group(3).strip()
+
+    # "Unverified" badge sits next to the company name under the main heading
+    h1 = soup.find("h1")
+    h2 = h1.find_next("h2") if h1 else None
+    if h2 is not None:
+        if not info["company"]:
+            info["company"] = h2.get_text(" ", strip=True)
+        badge = " ".join(f"{i.get('alt', '')} {i.get('src', '')}" for i in h2.find_all("img")).lower()
+        if "unverified" in badge:
+            info["unverified"] = True
+        elif badge:
+            info["unverified"] = False
+
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"Apply Before:?\s*" + _DATE_RE, text)
+    if m:
+        info["apply_before"] = _parse_date(m.group(1))
+    m = re.search(r"Posting Date:?\s*" + _DATE_RE, text) or re.search(r"Posted\s+" + _DATE_RE, text)
+    if m:
+        info["posted"] = _parse_date(m.group(1))
+
+    apply_a = soup.find("a", string=re.compile(r"Apply Now", re.IGNORECASE))
+    href = (apply_a.get("href") or "") if apply_a else ""
+    info["crawled"] = "crawljob" in href or "rozeegpt" in href
+    return info
+
+
+def fetch_page_html(url: str, browser=None) -> str:
+    """Rozee job pages are server-rendered, so a plain request is enough (fast).
+    Falls back to the real browser if that fails."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        if browser is None:
+            raise
+        return fetch_rendered_html(browser, url, wait_ms=1500)
+
+
+def _is_watch_company(company: str) -> bool:
+    if "norm" not in _WATCH_CACHE:
+        try:
+            _WATCH_CACHE["norm"] = load_watchlist()[1]
+        except Exception:
+            _WATCH_CACHE["norm"] = set()
+    return bool(company) and on_watchlist(company, _WATCH_CACHE["norm"])
+
+
+def _short(d):
+    return d.strftime("%b %d") if d else "?"
+
+
+def handle_rozee(name, url, html, seen, new_findings, job_links, browser=None):
     jobs = extract_rozee_jobs(html, url)
     if ROZEE_ALLOWED_CITIES:
         in_city = [j for j in jobs if any(c in j["slug"] for c in ROZEE_ALLOWED_CITIES)]
@@ -531,14 +613,44 @@ def handle_rozee(name, url, html, seen, new_findings, job_links):
          f"{len(matched)} match keywords, {len(fresh)} new")
     if not jobs:
         rlog(f"[rozee] {name}: WARNING no job links found - page not rendered or Rozee changed its layout")
-    for j in matched[:3]:
-        rlog(f"[rozee]    sample: {j['title']} -> {j['link']}")
 
-    label = "Rozee.pk (Lahore)" if ROZEE_ALLOWED_CITIES == ("lahore",) else "Rozee.pk"
-    for j in fresh:
-        display = f"{j['title']} (#{j['id']})"
+    today = datetime.now(timezone.utc).date()
+    expired = unverified_n = alerted = 0
+    for n, j in enumerate(fresh):
+        info = {}
+        if n < ROZEE_ENRICH_MAX:
+            try:
+                info = parse_rozee_job_page(fetch_page_html(j["link"], browser))
+            except Exception as e:
+                rlog(f"[rozee]    could not open job #{j['id']}: {str(e)[:80]}")
+        if info.get("apply_before") and info["apply_before"] < today:
+            expired += 1  # deadline already passed - not worth an alert (still remembered below)
+            continue
+        if info.get("unverified"):
+            unverified_n += 1
+            if ROZEE_SKIP_UNVERIFIED:
+                continue
+
+        company = info.get("company") or ""
+        star = "\u2605 " if _is_watch_company(company) else ""
+        flag = " - UNVERIFIED" if info.get("unverified") else ""
+        label = f"{star}{company} (Rozee{flag})" if company else "Rozee.pk (Lahore)"
+        extra = []
+        if info.get("posted"):
+            extra.append(f"posted {_short(info['posted'])}")
+        if info.get("apply_before"):
+            extra.append(f"apply by {_short(info['apply_before'])}")
+        if info.get("crawled"):
+            extra.append("applies via Rozee AI, not the company")
+        display = f"{j['title']} (#{j['id']})" + (f" - {', '.join(extra)}" if extra else "")
         new_findings.setdefault(label, []).append(display)
         job_links[(label, display)] = j["link"]
+        alerted += 1
+        if alerted <= 3:
+            rlog(f"[rozee]    sample: {j['title']} @ {company or '?'}{flag} | {', '.join(extra) or 'no details'}")
+
+    if fresh:
+        rlog(f"[rozee] {name}: {alerted} alerted, {expired} skipped (deadline passed), {unverified_n} from unverified companies")
 
     merged = already | {f"{j['id']}|{j['title']}" for j in matched}
     # keep the file small: newest 3000 ids only
@@ -565,10 +677,10 @@ def blog(msg: str):
     REMOTE_REPORT.append(msg)
 
 
-def http_get_json(url: str, timeout: int = 40):
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (personal job alert script)", "Accept": "application/json"}
-    )
+def http_get_json(url: str, timeout: int = 40, headers: dict = None):
+    base_headers = {"User-Agent": "Mozilla/5.0 (personal job alert script)", "Accept": "application/json"}
+    base_headers.update(headers or {})
+    req = urllib.request.Request(url, headers=base_headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -640,6 +752,121 @@ def check_remote_boards(seen: dict, new_findings: dict, job_links: dict):
         blog(f"[remote] Remotive failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# JSearch (OpenWeb Ninja) = official API over Google for Jobs. Google for Jobs
+# already collects LinkedIn, Indeed, Glassdoor and company-site postings, so this
+# is the legitimate way to see them without scraping those sites.
+# Free plan has a small monthly quota, so we use ~2 requests per day:
+#   - 1 request per query, once a day (manual "Run workflow" also runs it)
+# Needs the GitHub secret JSEARCH_API_KEY (RapidAPI key). Optional secret
+# JSEARCH_PROVIDER=openwebninja if you use a key from api.openwebninja.com.
+# ---------------------------------------------------------------------------
+JSEARCH_QUERIES = [
+    "frontend developer in Lahore, Pakistan",
+    "react developer in Lahore, Pakistan",
+]
+JSEARCH_RUN_HOURS_UTC = {6, 7}
+JSEARCH_DATE_POSTED = "3days"  # all | today | 3days | week | month
+JSEARCH_CITY_WORDS = ("lahore",)  # on-site city filter; remote jobs are skipped
+JSEARCH_REPORT = []
+
+
+def jslog(msg: str):
+    print(msg)
+    JSEARCH_REPORT.append(msg)
+
+
+def jsearch_fetch(query: str):
+    key = os.environ["JSEARCH_API_KEY"]
+    provider = (os.environ.get("JSEARCH_PROVIDER") or "rapidapi").lower()
+    params = urlencode({"query": query, "page": "1", "num_pages": "1", "country": "pk",
+                        "date_posted": JSEARCH_DATE_POSTED})
+    if provider == "openwebninja":
+        url, headers = f"https://api.openwebninja.com/jsearch/search?{params}", {"x-api-key": key}
+    else:
+        url = f"https://jsearch.p.rapidapi.com/search?{params}"
+        headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
+    data = http_get_json(url, headers=headers)
+    return (data.get("data") if isinstance(data, dict) else None) or []
+
+
+def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
+    if not os.environ.get("JSEARCH_API_KEY"):
+        return  # not configured - stay silent
+    manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    if not manual and datetime.now(timezone.utc).hour not in JSEARCH_RUN_HOURS_UTC:
+        jslog("[jsearch] skipped this run (queried once a day to save the free quota)")
+        return
+
+    already = set(seen.get("JSearch", []))
+    watch_norm = set()
+    try:
+        watch_norm = load_watchlist()[1]
+    except Exception:
+        pass
+
+    found = {}  # dedupe key -> (employer, title, publisher, link, posted, starred)
+    for q in JSEARCH_QUERIES:
+        try:
+            data = jsearch_fetch(q)
+        except Exception as e:
+            jslog(f"[jsearch] '{q}' failed: {e}")
+            break  # quota/auth problem: stop, do not burn more requests
+        jslog(f"[jsearch] '{q}': {len(data)} results")
+        for j in data[:4]:
+            jslog(f"[jsearch]    sample: {clean_text(j.get('job_title'))} @ {clean_text(j.get('employer_name'))} "
+                  f"via {clean_text(j.get('job_publisher'))} ({clean_text(j.get('job_city'))})")
+        for j in data:
+            title = clean_text(j.get("job_title"))
+            employer = clean_text(j.get("employer_name")) or "Unknown company"
+            where = " ".join(clean_text(j.get(k)) for k in ("job_city", "job_state", "job_location")).lower()
+            if not title or j.get("job_is_remote") or not any(c in where for c in JSEARCH_CITY_WORDS):
+                continue
+            if EXCLUDE_RE.search(title):
+                continue
+            starred = on_watchlist(employer, watch_norm) if watch_norm else False
+            if not (WATCH_ROLE_RE.search(title) if starred else KEYWORD_RE.search(title)):
+                continue
+            key = norm_company(employer) + "|" + re.sub(r"[^a-z0-9]+", "", title.lower())
+            if key in found:
+                continue  # same job listed on several sites
+            posted = clean_text(j.get("job_posted_at_datetime_utc"))[:10]
+            found[key] = (employer, title, clean_text(j.get("job_publisher")) or "web",
+                          j.get("job_apply_link") or "", posted, starred)
+
+    fresh = 0
+    for key, (employer, title, publisher, link, posted, starred) in found.items():
+        if key in already:
+            continue
+        star = "\u2605 " if starred else ""
+        label = f"{star}{employer} (via {publisher})"
+        display = f"{title}" + (f" - posted {posted}" if posted else "")
+        new_findings.setdefault(label, []).append(display)
+        job_links[(label, display)] = link
+        fresh += 1
+    seen["JSearch"] = sorted(already | set(found))[-3000:]
+    jslog(f"[jsearch] {len(found)} Lahore on-site jobs match, {fresh} new")
+
+
+# Companies you never want alerts for (e.g. your current employer).
+IGNORE_COMPANIES = ["Offneo"]
+
+
+def drop_ignored(new_findings: dict) -> dict:
+    ignore = {norm_company(n) for n in IGNORE_COMPANIES if n}
+    if not ignore:
+        return new_findings
+    kept = {}
+    for label, jobs in new_findings.items():
+        name = re.sub(r"^\u2605\s*", "", label)
+        name = re.split(r"\s+\((?:Rozee|via )", name)[0]
+        if norm_company(name) in ignore:
+            print(f"[ignore] dropped {len(jobs)} job(s) from {name}")
+            continue
+        kept[label] = jobs
+    return kept
+
+
 def write_step_summary(total, skipped, suspicious, new_findings):
     """Shows a readable report on the GitHub run's Summary page."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -651,6 +878,8 @@ def write_step_summary(total, skipped, suspicious, new_findings):
            f"- New jobs found this run (emailed): **{new_jobs}**", "",
            "### Jooble", ""]
     out += [f"- {line.replace('[jooble] ', '').strip()}" for line in JOOBLE_REPORT] or ["- (Jooble did not run)"]
+    if JSEARCH_REPORT:
+        out += ["", "### JSearch (LinkedIn / Indeed / Glassdoor via Google for Jobs)", ""] + [f"- {l.replace('[jsearch] ', '').strip()}" for l in JSEARCH_REPORT]
     if REMOTE_REPORT:
         out += ["", "### Remote job boards (RemoteOK / Remotive)", ""] + [f"- {l.replace('[remote] ', '').strip()}" for l in REMOTE_REPORT]
     if ROZEE_REPORT:
@@ -661,6 +890,83 @@ def write_step_summary(total, skipped, suspicious, new_findings):
         out += ["", "### Blocked / empty pages", ""] + [f"- {n}" for n in suspicious]
     with open(path, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
+
+
+def chunk_alert_text(new_findings: dict, company_urls: dict, job_links: dict = None, limit: int = 3500):
+    """Plain-text alert split into messages shorter than `limit` characters."""
+    job_links = job_links or {}
+    total = sum(len(v) for v in new_findings.values())
+    messages, current = [], f"New jobs: {total}\n"
+    for company, jobs in new_findings.items():
+        started = False
+        for job in jobs:
+            link = job_links.get((company, job)) or company_urls.get(company) or ""
+            entry = f"- {job}" + (f"\n  {link}" if link else "")
+            extra = ("" if started else f"\n{company}") + "\n" + entry
+            if len(current) + len(extra) > limit:
+                messages.append(current)
+                current = f"\n{company} (continued)"
+                extra = "\n" + entry
+            current += extra
+            started = True
+    messages.append(current)
+    return messages
+
+
+def ntfy_post(text: str, title: str = "Job alert", click: str = ""):
+    """Free instant phone notification via ntfy (https://ntfy.sh). Needs the
+    GitHub secret NTFY_TOPIC (a long random name you also subscribe to in the
+    ntfy app). Does nothing if it is not set."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    server = (os.environ.get("NTFY_SERVER") or "https://ntfy.sh").rstrip("/")
+    headers = {"Title": title, "Priority": "high", "Tags": "briefcase"}  # headers must be plain ASCII
+    if click and click.isascii():
+        headers["Click"] = click  # tapping the notification opens this link
+    req = urllib.request.Request(f"{server}/{topic}", data=text.encode("utf-8"), headers=headers, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+        print("[ntfy] sent")
+    except Exception as e:
+        print(f"[ntfy] failed: {e}")
+
+
+def send_ntfy(new_findings: dict, company_urls: dict, job_links: dict = None):
+    if not os.environ.get("NTFY_TOPIC"):
+        return
+    job_links = job_links or {}
+    first_link = next((l for l in job_links.values() if l), "")
+    total = sum(len(v) for v in new_findings.values())
+    for i, text in enumerate(chunk_alert_text(new_findings, company_urls, job_links, limit=3500)):
+        ntfy_post(text, title=f"{total} new job(s)" if i == 0 else "More jobs", click=first_link if i == 0 else "")
+
+
+def send_telegram(new_findings: dict, company_urls: dict, job_links: dict = None):
+    """Instant phone alert. Needs two GitHub secrets: TELEGRAM_BOT_TOKEN and
+    TELEGRAM_CHAT_ID. If they are missing this does nothing."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    job_links = job_links or {}
+    total = sum(len(v) for v in new_findings.values())
+
+    messages = chunk_alert_text(new_findings, company_urls, job_links, limit=3500)
+
+    for text in messages:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=30).read()
+        except Exception as e:
+            print(f"[telegram] failed: {e}")
+            return
+    print(f"[telegram] sent {len(messages)} message(s)")
 
 
 def main():
@@ -694,7 +1000,7 @@ def main():
                             html = fetch_rendered_html(browser, url, wait_ms=10000)
                         except Exception as e:
                             print(f"[retry-fail] {name}: {e}")
-                    handle_rozee(name, url, html, seen, new_findings, job_links)
+                    handle_rozee(name, url, html, seen, new_findings, job_links, browser)
                     continue
 
                 lines = extract_candidate_lines(html)
@@ -736,6 +1042,8 @@ def main():
 
     check_jooble(seen, new_findings, job_links)
     check_remote_boards(seen, new_findings, job_links)
+    check_jsearch(seen, new_findings, job_links)
+    new_findings = drop_ignored(new_findings)
     new_findings = dict(sorted(new_findings.items(), key=lambda kv: not kv[0].startswith("★")))
 
     if suspicious:
@@ -746,9 +1054,21 @@ def main():
     STATE_FILE.write_text(json.dumps(seen, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if new_findings:
+        try:
+            send_ntfy(new_findings, company_urls, job_links)
+        except Exception as e:
+            print(f"[ntfy] error: {e}")
+        try:
+            send_telegram(new_findings, company_urls, job_links)
+        except Exception as e:
+            print(f"[telegram] error: {e}")
         send_email(new_findings, company_urls, job_links)
     else:
         print("No new matches this run.")
+
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":  # manual run = connection test
+        ntfy_post(f"Manual run finished. New jobs this run: {sum(len(v) for v in new_findings.values())}. "
+                  "If you can read this, phone alerts work.", title="Job monitor test")
 
     write_step_summary(len(companies), skipped, suspicious, new_findings)
 
