@@ -787,7 +787,10 @@ def jsearch_fetch(query: str):
         url = f"https://jsearch.p.rapidapi.com/search?{params}"
         headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
     data = http_get_json(url, headers=headers)
-    return (data.get("data") if isinstance(data, dict) else None) or []
+    payload = data.get("data") if isinstance(data, dict) else None
+    if isinstance(payload, dict):  # newer API shape: {"data": {"jobs": [...], "cursor": "..."}}
+        payload = payload.get("jobs")
+    return payload if isinstance(payload, list) else []  # older shape: {"data": [...]}
 
 
 def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
