@@ -42,6 +42,15 @@ jobs:
           git config user.name "job-monitor-bot"
           git config user.email "actions@github.com"
           git add seen_jobs.json
-          git diff --quiet --cached || git commit -m "Update seen jobs [skip ci]"
-          git pull --rebase origin main
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to save"
+            exit 0
+          fi
+          git commit -m "Update seen jobs [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && exit 0
+            echo "Push failed (attempt $i), retrying in $((i*20)) seconds..."
+            sleep $((i*20))
+          done
+          echo "Could not push after 5 attempts"
+          exit 1
