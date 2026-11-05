@@ -17,6 +17,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -771,6 +772,31 @@ JSEARCH_DATE_POSTED = "3days"  # all | today | 3days | week | month
 JSEARCH_CITY_WORDS = ("lahore",)  # on-site city filter; remote jobs are skipped
 JSEARCH_REPORT = []
 
+# Google for Jobs in Pakistan is full of re-posted copies (Expertini, Jooble, JobLeads...).
+# For every job we pick the best place to apply: 1) the employer's own link, 2) a trusted
+# board, 3) anything not on the junk list. If only junk aggregators list it, we skip it.
+GOOD_PUBLISHER_RE = re.compile(r"linkedin|indeed|glassdoor|rozee", re.IGNORECASE)
+BAD_PUBLISHER_RE = re.compile(
+    r"expertini|jooble|jobleads|find jobs|jobzlelo|whatjobs|bebee|talent\.com|neuvoo|jobrapido|"
+    r"learn4good|careerjet|adzuna|lensa|jobilize|recruit\.net|trovit|jobsora|jobted|tuijobs|"
+    r"joblift|jobisjob|jora|jobsrmine|jobtome|jobsinpakistan|jobz",
+    re.IGNORECASE,
+)
+
+
+def best_apply_option(j: dict):
+    """Return (publisher, link) of the best place to apply, or None if only junk sites have it."""
+    cands = [(clean_text(o.get("publisher")), o.get("apply_link") or "", bool(o.get("is_direct")))
+             for o in (j.get("apply_options") or []) if isinstance(o, dict)]
+    cands.append((clean_text(j.get("job_publisher")), j.get("job_apply_link") or "", bool(j.get("job_apply_is_direct"))))
+    for pred in (lambda p, l, d: d,
+                 lambda p, l, d: bool(GOOD_PUBLISHER_RE.search(p)),
+                 lambda p, l, d: not BAD_PUBLISHER_RE.search(p)):
+        for pub, link, direct in cands:
+            if link and pred(pub, link, direct):
+                return pub or "employer site", link
+    return None
+
 
 def jslog(msg: str):
     print(msg)
@@ -828,6 +854,7 @@ def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
         pass
 
     found = {}  # dedupe key -> (employer, title, publisher, link, posted, starred)
+    dropped_junk = set()
     for q in JSEARCH_QUERIES:
         try:
             data = jsearch_fetch(q)
@@ -841,8 +868,11 @@ def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
         for j in data:
             title = clean_text(j.get("job_title"))
             employer = clean_text(j.get("employer_name")) or "Unknown company"
-            where = " ".join(clean_text(j.get(k)) for k in ("job_city", "job_state", "job_location")).lower()
-            if not title or j.get("job_is_remote") or not any(c in where for c in JSEARCH_CITY_WORDS):
+            city = clean_text(j.get("job_city")).lower()
+            where = city or " ".join(clean_text(j.get(k)) for k in ("job_state", "job_location")).lower()
+            if not title or j.get("job_is_remote") or re.search(r"\bremote\b", title, re.IGNORECASE):
+                continue
+            if not any(c in where for c in JSEARCH_CITY_WORDS):
                 continue
             if EXCLUDE_RE.search(title):
                 continue
@@ -852,9 +882,12 @@ def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
             key = norm_company(employer) + "|" + re.sub(r"[^a-z0-9]+", "", title.lower())
             if key in found:
                 continue  # same job listed on several sites
+            option = best_apply_option(j)
+            if option is None:
+                dropped_junk.add(key)  # only junk aggregators list this job
+                continue
             posted = clean_text(j.get("job_posted_at_datetime_utc"))[:10]
-            found[key] = (employer, title, clean_text(j.get("job_publisher")) or "web",
-                          j.get("job_apply_link") or "", posted, starred)
+            found[key] = (employer, title, option[0], option[1], posted, starred)
 
     fresh = 0
     for key, (employer, title, publisher, link, posted, starred) in found.items():
@@ -867,7 +900,8 @@ def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
         job_links[(label, display)] = link
         fresh += 1
     seen["JSearch"] = sorted(already | set(found))[-3000:]
-    jslog(f"[jsearch] {len(found)} Lahore on-site jobs match, {fresh} new")
+    jslog(f"[jsearch] {len(found)} Lahore on-site jobs match, {fresh} new "
+          f"({len(dropped_junk)} skipped: listed only on junk aggregator sites)")
 
 
 # Companies you never want alerts for (e.g. your current employer).
@@ -1009,6 +1043,8 @@ def main():
         try:
             for company in companies:
                 name, url = company["name"], company["url"]
+                if ROZEE_MARK in url:
+                    time.sleep(5)  # Rozee sometimes returns empty pages when hit too fast
                 try:
                     html = fetch_rendered_html(browser, url)
                 except Exception as e:
@@ -1017,9 +1053,12 @@ def main():
                     continue
 
                 if ROZEE_MARK in url:
-                    if not extract_rozee_jobs(html, url):  # not rendered yet - retry once, slower
+                    for wait_ms, pause in ((10000, 8), (15000, 25)):  # empty page: retry up to twice, slower
+                        if extract_rozee_jobs(html, url):
+                            break
+                        time.sleep(pause)
                         try:
-                            html = fetch_rendered_html(browser, url, wait_ms=10000)
+                            html = fetch_rendered_html(browser, url, wait_ms=wait_ms)
                         except Exception as e:
                             print(f"[retry-fail] {name}: {e}")
                     handle_rozee(name, url, html, seen, new_findings, job_links, browser)
