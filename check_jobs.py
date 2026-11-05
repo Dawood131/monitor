@@ -777,7 +777,7 @@ def jslog(msg: str):
     JSEARCH_REPORT.append(msg)
 
 
-JSEARCH_PATHS = ["/search", "/job-search"]  # tried in order; only a 404 moves on to the next one
+JSEARCH_PATHS = ["/search-v2", "/search"]  # JSearch retired /search; /search-v2 is current. Only a 404 moves on.
 
 
 def jsearch_fetch(query: str):
