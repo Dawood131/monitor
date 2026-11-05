@@ -17,6 +17,7 @@ import os
 import re
 import smtplib
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -776,21 +777,39 @@ def jslog(msg: str):
     JSEARCH_REPORT.append(msg)
 
 
+JSEARCH_PATHS = ["/search", "/job-search"]  # tried in order; only a 404 moves on to the next one
+
+
 def jsearch_fetch(query: str):
     key = os.environ["JSEARCH_API_KEY"]
     provider = (os.environ.get("JSEARCH_PROVIDER") or "rapidapi").lower()
-    params = urlencode({"query": query, "page": "1", "num_pages": "1", "country": "pk",
-                        "date_posted": JSEARCH_DATE_POSTED})
+    params = urlencode({"query": query, "num_pages": "1", "country": "pk", "date_posted": JSEARCH_DATE_POSTED})
     if provider == "openwebninja":
-        url, headers = f"https://api.openwebninja.com/jsearch/search?{params}", {"x-api-key": key}
+        base, headers = "https://api.openwebninja.com/jsearch", {"x-api-key": key}
     else:
-        url = f"https://jsearch.p.rapidapi.com/search?{params}"
+        base = "https://jsearch.p.rapidapi.com"
         headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
-    data = http_get_json(url, headers=headers)
-    payload = data.get("data") if isinstance(data, dict) else None
-    if isinstance(payload, dict):  # newer API shape: {"data": {"jobs": [...], "cursor": "..."}}
-        payload = payload.get("jobs")
-    return payload if isinstance(payload, list) else []  # older shape: {"data": [...]}
+
+    last = "no attempt made"
+    for path in JSEARCH_PATHS:
+        try:
+            data = http_get_json(f"{base}{path}?{params}", headers=headers)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:200].replace("\n", " ")
+            except Exception:
+                body = ""
+            last = f"HTTP {e.code} on {path}: {body}"
+            if e.code == 404:
+                continue  # wrong path - try the next one
+            raise RuntimeError(last)
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(payload, dict):  # newer API shape: {"data": {"jobs": [...], "cursor": "..."}}
+            payload = payload.get("jobs")
+        if path != JSEARCH_PATHS[0]:
+            jslog(f"[jsearch] note: this API answers on {path}")
+        return payload if isinstance(payload, list) else []  # older shape: {"data": [...]}
+    raise RuntimeError(last)
 
 
 def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
