@@ -772,6 +772,11 @@ JSEARCH_DATE_POSTED = "3days"  # all | today | 3days | week | month
 JSEARCH_CITY_WORDS = ("lahore",)  # on-site city filter; remote jobs are skipped
 JSEARCH_REPORT = []
 
+# True  = jobs that only junk aggregators list are still alerted, but clearly marked
+#         "unverified" (so a good lead is not lost, and you can check the company first)
+# False = such jobs are silently dropped
+JSEARCH_SHOW_UNVERIFIED = True
+
 # Google for Jobs in Pakistan is full of re-posted copies (Expertini, Jooble, JobLeads...).
 # For every job we pick the best place to apply: 1) the employer's own link, 2) a trusted
 # board, 3) anything not on the junk list. If only junk aggregators list it, we skip it.
@@ -883,25 +888,30 @@ def check_jsearch(seen: dict, new_findings: dict, job_links: dict):
             if key in found:
                 continue  # same job listed on several sites
             option = best_apply_option(j)
-            if option is None:
-                dropped_junk.add(key)  # only junk aggregators list this job
-                continue
+            unverified = False
+            if option is None:  # only junk aggregators list this job
+                dropped_junk.add(key)
+                if not JSEARCH_SHOW_UNVERIFIED:
+                    continue
+                option = (clean_text(j.get("job_publisher")) or "aggregator", j.get("job_apply_link") or "")
+                unverified = True
             posted = clean_text(j.get("job_posted_at_datetime_utc"))[:10]
-            found[key] = (employer, title, option[0], option[1], posted, starred)
+            found[key] = (employer, title, option[0], option[1], posted, starred, unverified)
 
     fresh = 0
-    for key, (employer, title, publisher, link, posted, starred) in found.items():
+    for key, (employer, title, publisher, link, posted, starred, unverified) in found.items():
         if key in already:
             continue
         star = "\u2605 " if starred else ""
-        label = f"{star}{employer} (via {publisher})"
+        label = f"{star}{employer} (via {publisher}{' - UNVERIFIED, check the company first' if unverified else ''})"
         display = f"{title}" + (f" - posted {posted}" if posted else "")
         new_findings.setdefault(label, []).append(display)
         job_links[(label, display)] = link
         fresh += 1
     seen["JSearch"] = sorted(already | set(found))[-3000:]
+    note = "flagged UNVERIFIED" if JSEARCH_SHOW_UNVERIFIED else "skipped"
     jslog(f"[jsearch] {len(found)} Lahore on-site jobs match, {fresh} new "
-          f"({len(dropped_junk)} skipped: listed only on junk aggregator sites)")
+          f"({len(dropped_junk)} {note}: listed only on junk aggregator sites)")
 
 
 # Companies you never want alerts for (e.g. your current employer).
